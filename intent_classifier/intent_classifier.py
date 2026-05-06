@@ -27,16 +27,15 @@ python intent_classifier.py train \
     --save_model="confusion/confusion.keras" \
     --wandb_project="mlops-2026-1"
 
+python intent_classifier.py train \
+    --config="clair_intents/clair_intents_config.yml" \
+    --training_data="clair_intents/clair_intents.yml" \
+    --save_model="clair_intents/clair_intents.keras" \
+    --wandb_project="mlops-2026-1"
+
 python intent_classifier.py predict \
     --load_model="models/confusion.keras" \
     --input_text="teste teste" \
-    --wandb_project="intent-classifier"
-
-# TODO: Fix CV implementation...
-python intent_classifier.py cross_validation \
-    --config="models/confusion_config.yml" \
-    --training_data="data/confusion_intents.yml" \
-    --n_splits=5 \
     --wandb_project="intent-classifier"
 
 """
@@ -328,6 +327,9 @@ class IntentClassifier:
         """
         self.training_data = training_data
         if training_data is not None:
+            dataset_name = os.path.splitext(os.path.basename(training_data))[0]
+            if hasattr(self, 'config') and self.config is not None:
+                self.config.dataset_name = dataset_name
             pprint(f"Loading intents from {training_data}...")
             with open(training_data, 'r') as f:
                 self.intents_data = yaml.safe_load(f)
@@ -692,87 +694,6 @@ class IntentClassifier:
             return results[0]
         return results
 
-    def cross_validation(self, n_splits: int = 3) -> List[Dict[str, Any]]:
-        """
-        Performs stratified K-fold cross-validation.
-
-        This method trains and evaluates the model `n_splits` times on different
-        folds of the data. Metrics for each fold and the average metrics are
-        logged to Weights & Biases if configured.
-
-        :param n_splits: The number of folds to use for cross-validation.
-        :type n_splits: int, optional
-        :return: A list of dictionaries, where each dictionary is the classification
-                 report (from `sklearn.metrics.classification_report`) for a fold.
-        :rtype: list[dict(str, Any)]
-        :raises AssertionError: If `training_data` was not provided during initialization.
-        """
-        assert self.training_data is not None, "training_data must be provided when the IntentClassifier was created."
-        # Update task config parameter
-        self.config.task = "cross_validation"
-        kf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        
-        # Preprocess the entire dataset once
-        preprocessed_input_text = tf.map_fn(self.preprocess_text, self.input_text, dtype=tf.string)
-        
-        # Get one-hot encoded labels before the loop
-        labels_ohe = self.onehot_encoder.transform(self.labels.reshape(-1, 1)).toarray()
-        
-        results = []
-        
-        for i, (train_index, test_index) in enumerate(kf.split(preprocessed_input_text.numpy(), self.labels)):
-            print(f"Fold {i+1}/{n_splits}")
-            # Create and log a new Wandb run for each fold
-            run_name = f"cv_fold_{i+1}"
-            with wandb.init(project=self.wandb_project, config=self.config.__dict__, 
-                            group="cross_validation", name=run_name, reinit=True, 
-                            job_type=f"fold_{i+1}"):
-                
-                # Create a new model for each fold
-                model = self.make_model(self.config)
-                model.compile(
-                    loss='categorical_crossentropy',
-                    optimizer=tf.keras.optimizers.Adam(), # LR handled by callback
-                    metrics=[tf.keras.metrics.F1Score(average='macro')])
-                
-                # Get train/test splits for this fold
-                X_train, X_test = preprocessed_input_text[train_index], preprocessed_input_text[test_index]
-                y_train_ohe, y_test_ohe = labels_ohe[train_index], labels_ohe[test_index]
-
-                # Train the model on the current fold
-                model.fit(X_train, y_train_ohe,
-                          epochs=self.config.epochs, verbose=0,
-                          validation_data=(X_test, y_test_ohe), # Use test fold as validation
-                          callbacks=self._get_callbacks()) # WandbMetricsLogger is already added in _get_callbacks()
-                
-                # Predict on the test set for the current fold
-                preds_probs = model.predict(X_test)
-                preds = self.onehot_encoder.inverse_transform(preds_probs)
-                labels = self.onehot_encoder.inverse_transform(y_test_ohe)
-                
-                # Evaluate the model and store the results
-                res = classification_report(labels, preds, output_dict=True, zero_division=0)
-                res['kappa'] = cohen_kappa_score(labels, preds)
-                results.append(res)
-                
-                # Log fold-specific metrics
-                wandb.log({"fold_results": res, "val_f1_macro": res["macro avg"]["f1-score"], "val_kappa": res['kappa']})
-        
-        # Calculate and print average metrics
-        avg_f1 = np.mean([r['macro avg']['f1-score'] for r in results])
-        avg_kappa = np.mean([r['kappa'] for r in results])
-        print(f"Average f1-score: {avg_f1}")
-        print(f"Average kappa: {avg_kappa}")
-        
-        # Log average metrics to a summary run
-        with wandb.init(project=self.wandb_project, config=self.config.__dict__, 
-                        group="cross_validation", name="cv_summary", reinit=True, 
-                        job_type="summary"):
-            wandb.log({"avg_f1_macro": avg_f1, "avg_kappa": avg_kappa})
-            
-        self.finish_wandb() # Finish the last summary run
-        return results
-
 
 # This script works as a module and as a CLI tool
 if __name__ == "__main__":
@@ -812,26 +733,7 @@ if __name__ == "__main__":
         predictions = classifier.predict(input_text)
         print(f"Predictions: {predictions}")
 
-    def cross_validation(config: str, training_data: str, n_splits: int = 3, wandb_project: str = None):
-        """
-        Run cross-validation on the model.
-
-        :param config: Path to the YAML configuration file.
-        :type config: str
-        :param training_data: Path to the YAML file with training examples.
-        :type training_data: str
-        :param n_splits: The number of folds to use.
-        :type n_splits: int, optional
-        :param wandb_project: Name of the Weights & Biases project to log to.
-        :type wandb_project: str
-        """
-        classifier = IntentClassifier(config=config, training_data=training_data, wandb_project=wandb_project)
-        results = classifier.cross_validation(n_splits=n_splits)
-        print("Cross-validation completed successfully!")
-        pprint(results)
-
     fire.Fire({
         'train': train,
-        'predict': predict,
-        'cross_validation': cross_validation
+        'predict': predict
     }, serialize=False)
